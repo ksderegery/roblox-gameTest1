@@ -1,0 +1,261 @@
+export type Connection = {
+	Connected: boolean,
+	Disconnect: typeof(
+		-- Removes the connection from the signal.
+		-- The connection’s data remains.
+		function(connection: Connection) end
+	)
+}
+export type Signal<Parameters...> = {
+	Connect: typeof(
+		-- Connects a function.
+		function(signal: Signal<Parameters...>, callback: (Parameters...) -> ()): Connection end
+	),
+	Once: typeof(
+		-- Connects a function, then auto-disconnects after the first call.
+		function(signal: Signal<Parameters...>, callback: (Parameters...) -> ()): Connection end
+	),
+	Wait: typeof(
+		-- Yields the calling thread until the next fire.
+		function(signal: Signal<Parameters...>): Parameters... end
+	),
+	
+	Fire: typeof(
+		--✨
+		function(signal: Signal<Parameters...>, ...: Parameters...) end
+	),
+	
+	DisconnectAll: typeof(
+		-- Erases all connections.
+		-- <em>Much faster than calling <code>Disconnect</code> on each.</em>
+		function(signal: Signal<Parameters...>) end
+	),
+	Destroy: typeof(
+		-- Erases all connections and methods.
+		-- <strong>To fully erase, also remove all references to the signal.</strong>
+		function(signal: Signal<Parameters...>) end
+	)
+}
+type CreateSignal = typeof(
+	-- Creates a new signal.
+	function(): Signal end
+)
+
+-- Spawn function.
+local spawnThread = if script:GetAttribute("Deferred") then task.defer else task.spawn
+
+-- Setup callback threads.
+local threads = {}
+
+local function reusableThreadCall(callback, thread, ...)
+	callback(...)
+	table.insert(threads, thread)
+end
+local function reusableThread()
+	while true do
+		reusableThreadCall(coroutine.yield())
+	end
+end
+
+-- Connection methods.
+local Connection = {}
+Connection.__index = Connection
+
+Connection.Disconnect = function(connection)
+	-- Verify connection.
+	if not connection.Connected then return end
+	
+	-- Remove connection.
+	connection.Connected = nil
+	
+	local signal = connection.Signal
+	local previous = connection.Previous
+	local next = connection.Next
+	if previous then
+		previous.Next = next
+	else
+		signal.Tail = next
+	end
+	if next then
+		next.Previous = previous
+	else
+		signal.Head = previous
+	end
+end
+
+-- Signal methods.
+local Signal = {}
+Signal.__index = Signal
+
+Signal.Connect = function(signal, callback)
+	-- Linked list head.
+	local head = signal.Head
+	
+	-- Create connection.
+	local connection = {
+		Signal = signal,
+		Previous = head,
+		
+		Callback = callback,
+		
+		Connected = true
+	}
+	
+	-- Add connection.
+	if head then
+		head.Next = connection
+	else
+		signal.Tail = connection
+	end
+	signal.Head = connection
+	
+	-- Return connection.
+	return setmetatable(connection, Connection)
+end
+Signal.Once = function(signal, callback)
+	-- Linked list head.
+	local head = signal.Head
+	
+	-- Create connection.
+	local connection = nil
+	connection = {
+		Signal = signal,
+		Previous = head,
+		
+		Callback = function(...)
+			-- Verify connection.
+			if not connection.Connected then return end
+			
+			-- Remove connection.
+			connection.Connected = false
+			
+			local previous = connection.Previous
+			local next = connection.Next
+			if previous then
+				previous.Next = next
+			else
+				signal.Tail = next
+			end
+			if next then
+				next.Previous = previous
+			else
+				signal.Head = previous
+			end
+			
+			-- Fire callback.
+			callback(...)
+		end,
+		
+		Connected = true
+	}
+	
+	-- Add connection.
+	if head then
+		head.Next = connection
+	else
+		signal.Tail = connection
+	end
+	signal.Head = connection
+	
+	-- Return connection.
+	return setmetatable(connection, Connection)
+end
+Signal.Wait = function(signal)
+	-- Save this thread to resume later.
+	local thread = coroutine.running()
+	
+	-- Linked list head.
+	local head = signal.Head
+	
+	-- Create connection.
+	local connection = nil
+	connection = {
+		Previous = head,
+		
+		Callback = function(...)
+			-- Remove connection.
+			connection.Connected = false
+			
+			local previous = connection.Previous
+			local next = connection.Next
+			if previous then
+				previous.Next = next
+			else
+				signal.Tail = next
+			end
+			if next then
+				next.Previous = previous
+			else
+				signal.Head = previous
+			end
+			
+			-- Resume the thread.
+			if coroutine.status(thread) == "suspended" then -- To avoid creating new threads.
+				task.spawn(thread, ...)
+			end
+		end
+	}
+	
+	-- Add connection.
+	if head then
+		head.Next = connection
+	else
+		signal.Tail = connection
+	end
+	signal.Head = connection
+	
+	-- Yield until the next fire, then return the arguments on resume.
+	return coroutine.yield()
+end
+
+Signal.Fire = function(signal, ...)
+	local connection = signal.Tail -- Start from the tail (back) of the list.
+	while connection do
+		-- Find or create a thread, then run the callback in it.
+		local length = #threads
+		if length == 0 then
+			local thread = coroutine.create(reusableThread)
+			coroutine.resume(thread) -- Initialize.
+			spawnThread(thread, connection.Callback, thread, ...)
+		else
+			local thread = threads[length]
+			threads[length] = nil -- Remove from free threads list.
+			spawnThread(thread, connection.Callback, thread, ...)
+		end
+		-- Traverse.
+		connection = connection.Next
+	end
+end
+
+Signal.DisconnectAll = function(signal)
+	-- Remove all connections.
+	local connection = signal.Tail
+	while connection do
+		connection.Connected = nil
+		-- Traverse.
+		connection = connection.Next
+	end
+	-- Remove signal’s references.
+	signal.Tail = nil
+	signal.Head = nil
+end
+Signal.Destroy = function(signal)
+	-- Remove all connections.
+	local connection = signal.Tail
+	while connection do
+		connection.Connected = nil
+		-- Traverse.
+		connection = connection.Next
+	end
+	-- Remove signal’s references.
+	signal.Tail = nil
+	signal.Head = nil
+	
+	-- Unlink signal methods.
+	setmetatable(signal, nil)
+end
+
+-- Signal creation function.
+return function()
+	return setmetatable({}, Signal) -- New blank metatable with signal methods attached.
+end :: CreateSignal
